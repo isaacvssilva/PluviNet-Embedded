@@ -2,20 +2,18 @@ menu "Configurações MQTT / FIWARE (Estação)"
 
     config MQTT_BROKER_HOST
         string "MQTT Broker Host"
-        default "smart.quixada.ufc.br"
-        help
-            Endereço do servidor MQTT.
+        default "SEU_HOST_AQUI"
 
     config MQTT_BROKER_PORT
         int "MQTT Broker Port"
-        default 50001
+        default PORTA
 
     config FIWARE_API_KEY
         string "FIWARE API Key"
-        default "scggokgpepnvsb2uv4s40d5912"
+        default "COLOQUE_SUA_CHAVE_AQUI"
 
     config FIWARE_DEVICE_ID
         string "FIWARE Device ID"
-        default "pluvio_esp32_01"
+        default "NOME_DO_DISPOSITIVO"
 
 endmenu
