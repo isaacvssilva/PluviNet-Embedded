@@ -1,0 +1,6 @@
+# Ignora a pasta de compilação (arquivos muito pesados)
+build/
+
+# Ignora as configurações locais e chaves de API
+sdkconfig
+sdkconfig.old
