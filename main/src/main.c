@@ -1,16 +1,3 @@
-/*
- * Diagrama de conexão:
- *   DS3231 SDA  → GPIO 8  
- *   DS3231 SCL  → GPIO 9  
- *   DS3231 INT  → GPIO 4  (DS3231_INT_PIN, pull-up externo 10 kΩ)
- *   DS3231 VCC  → 3.3 V
- *   DS3231 GND  → GND
- *
- */
-
-/* Seleciona modo de temporização */
-#define USE_INTERNAL_RTC
- 
 #include <stdio.h>
 #include <inttypes.h>
 #include "freertos/FreeRTOS.h"
@@ -20,225 +7,258 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
-#include "esp_rom_sys.h"   
- 
+#include "esp_rom_sys.h"
+
+
+#include "wifi_provisioning/manager.h" 
+
 #include "inc/sensor_hall.h"
 #include "inc/sht30.h"
 #include "inc/wifi.h"
 #include "inc/mqtt.h"
- 
-#ifndef USE_INTERNAL_RTC
 #include "inc/ds3231.h"
-#endif
+#include "inc/uart.h"
 
+#define TAG "PROV_PLUVINET"
+#define SHT30_ADDR 0x44
+#define MQTT_TIMEOUT_MS 15000
+#define MQTT_ACK_DELAY_MS 2000
+#define HALL_PULSE_TIMEOUT_US 300000UL
+#define I2C_SDA_PIN 8
+#define I2C_SCL_PIN 9
 
-#define TAG               "PROV_PLUVINET"
-#define SHT30_ADDR        0x44
- 
-#ifdef USE_INTERNAL_RTC
-  #define SLEEP_SECONDS   60
-  #define SLEEP_US        ((uint64_t)SLEEP_SECONDS * 1000000ULL)
-#else
-  #define ALARM_MINUTES   1
-#endif
- 
-#define MQTT_TIMEOUT_MS   15000
-#define MQTT_ACK_DELAY_MS  2000
+#define CONST_CALIBRACAO 0.5261
 
-/*
- * Máximo tempo que aguardamos o pino do Hall voltar ao nível alto
- * após ser incrementado. Evita loop infinito se o hardware travar.
- */
-#define HALL_PULSE_TIMEOUT_US  300000UL
+#define TEMPO_RESET_MS 3000 // 3 segundos
 
+// Descomente para usar o RTC interno 
+#define USE_INTERNAL_RTC
 
-//nvs Non volatile storage
+static i2c_master_bus_handle_t s_i2c_bus = NULL;
+
+#define printf(...) uart_printf(__VA_ARGS__)
+
 static void init_nvs(void)
 {
-    esp_err_t ret = nvs_flash_init(); //tenta iniciar a memoria nvs
-    // verifica se ocorreu erro por falta de espaço
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
-        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase()); //se houve erro ele apaga a memoria nvs e tenta inicia-la novamente
-        ret = nvs_flash_init(); //tenta reiniciar a esp caso a inicialização da memoria falhe
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
 }
 
 static i2c_master_bus_handle_t init_i2c(void)
-{ //struct para configurar o I2C
+{
+    if (s_i2c_bus != NULL) {
+        return s_i2c_bus;
+    }
+
     i2c_master_bus_config_t bus_cfg = {
-        .clk_source                   = I2C_CLK_SRC_DEFAULT, //define a fonte de clock padrão
-        .i2c_port                     = I2C_NUM_0,           //define a porta
-        .sda_io_num                   = I2C_SDA_PIN,         //pinos de dados sda
-        .scl_io_num                   = I2C_SCL_PIN,         //pinos de dados scl
-        .glitch_ignore_cnt            = 7,                   //ignora pequenos ruidos
-        .flags.enable_internal_pullup = true,                // ativa resistores internos de pullup
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = I2C_SDA_PIN,
+        .scl_io_num = I2C_SCL_PIN,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
-    i2c_master_bus_handle_t bus;  //cria a variavel para representar o barramento
-    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &bus)); //aplica as config no hardware
-    return bus; //retorna a referencia do i2c configurado 
+
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &s_i2c_bus));
+    return s_i2c_bus;
 }
 
-/*
- * Configura o GPIO do pino INT do DS3231 como entrada com pull-up.
- * O DS3231 puxa o pino para LOW quando o alarme dispara.
- * O ESP32-C3 acorda quando detecta GPIO LOW no modo deep sleep.
- */
 #ifndef USE_INTERNAL_RTC
-/*
- * Configura o GPIO do pino INT do DS3231 como entrada com pull-up.
- */
 static void init_ds3231_gpio(void)
 {
+    gpio_hold_dis(DS3231_INT_PIN);
+
     gpio_config_t io = {
         .pin_bit_mask = (1ULL << DS3231_INT_PIN),
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
     };
-    gpio_config(&io);
+
+    ESP_ERROR_CHECK(gpio_config(&io));
+    ESP_ERROR_CHECK(gpio_sleep_sel_dis(DS3231_INT_PIN));
 }
 #endif
-
 
 static void configurar_wakeup(void)
 {
 #ifdef USE_INTERNAL_RTC
-    esp_sleep_enable_timer_wakeup(SLEEP_US);
- 
+    ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(600ULL * 1000000ULL));
+    // Se usar RTC interno, o botão também precisa poder acordar a placa:
+    ESP_ERROR_CHECK(esp_deep_sleep_enable_gpio_wakeup(
+        (1ULL << PIN_BOTAO_RESET) | (1ULL << PIN_HALL), 
+        ESP_GPIO_WAKEUP_GPIO_LOW));
 #else
     ESP_ERROR_CHECK(
         esp_deep_sleep_enable_gpio_wakeup(
-            (1ULL << PIN_HALL) | (1ULL << DS3231_INT_PIN),
-            ESP_GPIO_WAKEUP_GPIO_LOW));
-#endif
- 
-#ifdef USE_INTERNAL_RTC
-    ESP_ERROR_CHECK(
-        esp_deep_sleep_enable_gpio_wakeup(
-            1ULL << PIN_HALL,
+            (1ULL << PIN_HALL) | (1ULL << DS3231_INT_PIN) | (1ULL << PIN_BOTAO_RESET),
             ESP_GPIO_WAKEUP_GPIO_LOW));
 #endif
 }
 
+static void armar_proximo_despertar(void)
+{
+#ifdef USE_INTERNAL_RTC
+    ESP_LOGI(TAG, "Modo RTC interno: timer de 600s");
+#else
+    esp_err_t ret = ds3231_arm_alarm_1_minute();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao armar alarme DS3231: %s", esp_err_to_name(ret));
+    }
+#endif
+}
 
+static void verificar_botao_reset(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << PIN_BOTAO_RESET),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+
+    // Se o botão não estiver pressionado (nível lógico HIGH), sai da função
+    if (gpio_get_level(PIN_BOTAO_RESET) == 1) {
+        return;
+    }
+
+    ESP_LOGW(TAG, "Botão de reset pressionado! Segure por 3 segundos para apagar o Wi-Fi...");
+    
+    uint32_t tempo_segurando = 0;
+    while (gpio_get_level(PIN_BOTAO_RESET) == 0) { 
+        esp_rom_delay_us(100000); // Espera 100ms
+        tempo_segurando += 100;
+
+        if (tempo_segurando >= TEMPO_RESET_MS) {
+            ESP_LOGW(TAG, "============= FACTORY RESET =============");
+            ESP_LOGW(TAG, "Apagando credenciais de Wi-Fi da NVS...");
+            
+           nvs_flash_erase();
+            
+            ESP_LOGW(TAG, "Credenciais apagadas! Reiniciando em 2 segundos...");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            esp_restart(); 
+        }
+    }
+    ESP_LOGI(TAG, "Botão solto antes de 3 segundos. Reset cancelado.");
+}
 
 static void ciclo_completo(void)
 {
     esp_sleep_wakeup_cause_t causa = esp_sleep_get_wakeup_cause();
- 
-    /* Log do motivo */
-    switch (causa) {
-    case ESP_SLEEP_WAKEUP_TIMER:
-        ESP_LOGI(TAG, "Acordei: timer RTC interno");  break;
-    case ESP_SLEEP_WAKEUP_GPIO:
-        ESP_LOGI(TAG, "Acordei: DS3231 (GPIO4)");     break;
-    default:
-        ESP_LOGI(TAG, "Boot inicial ou reset");        break;
+
+    printf("\n================================================\n");
+    if (causa == ESP_SLEEP_WAKEUP_TIMER) {
+        printf("MOTIVO DO WAKEUP: [ TIMER INTERNO DA ESP32 ]\n");
+    } else if (causa == ESP_SLEEP_WAKEUP_GPIO) {
+        uint64_t gpio_status = esp_sleep_get_gpio_wakeup_status();
+        if (gpio_status & (1ULL << DS3231_INT_PIN)) {
+            printf("MOTIVO DO WAKEUP: [ RTC EXTERNO DS3231 ]\n");
+        } else if (gpio_status & (1ULL << PIN_HALL)) {
+            printf("MOTIVO DO WAKEUP: [ SENSOR HALL ]\n");
+        } else if (gpio_status & (1ULL << PIN_BOTAO_RESET)) {
+            printf("MOTIVO DO WAKEUP: [ BOTAO RESET (CANCELADO) ]\n");
+        } else {
+            printf("MOTIVO DO WAKEUP: [ GPIO ]\n");
+        }
+    } else {
+        printf("MOTIVO DO WAKEUP: [ ENERGIA LIGADA / RESET ]\n");
     }
- 
-    /*Lê e zera o contador de pulsos acumulado pelos quick wakeups*/
+    printf("================================================\n\n");
+
+    fflush(stdout);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
     uint32_t pulsos = sensor_hall_get_pulse_count();
     sensor_hall_set_pulse_count(0);
     ESP_LOGI(TAG, "Pulsos acumulados neste ciclo: %" PRIu32, pulsos);
- 
-    /*Hardware*/
-    init_nvs();
-    config_pin_hall();   /* reconfigura GPIO5*/
+
+    config_pin_hall();
     i2c_master_bus_handle_t i2c_bus = init_i2c();
-    ESP_ERROR_CHECK(sht30_init(i2c_bus, SHT30_ADDR));
- 
+
 #ifndef USE_INTERNAL_RTC
-    init_ds3231_gpio(); 
-    ESP_ERROR_CHECK(ds3231_init(i2c_bus));
-    /*
-     * Limpa o flag A1F imediatamente após acordar.
-     * Se não limpar, o pino INT permanece em LOW e o próximo
-     * alarme não consegue sinalizar nova borda.
-     */
-    ESP_ERROR_CHECK(ds3231_clear_alarm());
+    init_ds3231_gpio();
+    esp_err_t ret = ds3231_init(i2c_bus);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao inicializar DS3231: %s", esp_err_to_name(ret));
+    } else {
+        ret = ds3231_clear_alarm();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "ds3231_clear_alarm falhou: %s", esp_err_to_name(ret));
+        }
+    }
 #endif
- 
-    /*Rede e publicação*/
+
+    ESP_ERROR_CHECK(sht30_init(i2c_bus, SHT30_ADDR));
+
     wifi_init_prov();
     mqtt_app_start();
- 
-    if (!mqtt_wait_connected(MQTT_TIMEOUT_MS)) {
-        ESP_LOGE(TAG, "Timeout MQTT — publicação pulada neste ciclo");
-        goto sleep;
+
+    ESP_LOGI(TAG, "Aguardando conexão MQTT...");
+    if (mqtt_wait_connected(MQTT_TIMEOUT_MS)) {
+        if (sht30_read() == ESP_OK) {
+            char payload[128];
+                snprintf(payload, sizeof(payload),
+                     "t|%.2f#h|%.2f#r|%.2f",
+                     sht30_get_temperatura(),
+                     sht30_get_umidade(),
+                     (float)pulsos * CONST_CALIBRACAO);
+            ESP_LOGI(TAG, "-> FIWARE: %s", payload);
+            printf("SERIAL PAYLOAD: %s\n", payload);
+            mqtt_publish(MQTT_TOPIC_PUB, payload, 1);
+            vTaskDelay(pdMS_TO_TICKS(MQTT_ACK_DELAY_MS));
+        }
     }
- 
-    if (sht30_read() == ESP_OK) {
-        char payload[128];
-        snprintf(payload, sizeof(payload),
-                 "t|%.2f#h|%.2f#p|%" PRIu32,
-                 sht30_get_temperatura(),
-                 sht30_get_umidade(),
-                 pulsos);
- 
-        ESP_LOGI(TAG, "→ FIWARE: %s", payload);
-        mqtt_publish(MQTT_TOPIC_PUB, payload, 1);
- 
-        /* Aguarda ACK (QoS 1) antes de desligar o rádio */
-        vTaskDelay(pdMS_TO_TICKS(MQTT_ACK_DELAY_MS));
-    } else {
-        ESP_LOGE(TAG, "Falha na leitura SHT30");
-    }
- 
-sleep:
-    /*Configura wakeup e dorme*/
-#ifndef USE_INTERNAL_RTC
-    ESP_ERROR_CHECK(ds3231_arm_alarm(ALARM_MINUTES)); 
-#endif
+
+
+    armar_proximo_despertar();
     configurar_wakeup();
+
+    ESP_LOGI(TAG, "Entrando em Deep Sleep...");
+    vTaskDelay(pdMS_TO_TICKS(200));
+    fflush(stdout);
     esp_deep_sleep_start();
-    /* Nunca chega aqui */
 }
-
-
-
-
 
 void app_main(void)
 {
+    vTaskDelay(pdMS_TO_TICKS(1500));
 
-    /* Identifica o motivo do acordar para log */
+    init_nvs();
+
+    verificar_botao_reset();
+
+    config_pin_hall();
+    uart_init();
+    
     esp_sleep_wakeup_cause_t causa = esp_sleep_get_wakeup_cause();
     if (causa == ESP_SLEEP_WAKEUP_GPIO) {
         uint64_t gpio_status = esp_sleep_get_gpio_wakeup_status();
- 
+
         if (gpio_status & (1ULL << PIN_HALL)) {
- 
             sensor_hall_increment_pulse();
-            // Reconfigura rapidamente o pino apenas para leitura
             gpio_set_direction(PIN_HALL, GPIO_MODE_INPUT);
-            /*
-             * Aguarda o pino retornar ao nível HIGH (fim do pulso).
-             * Se dormirmos com GPIO5 ainda em LOW, o chip acorda
-             * imediatamente de novo
-             */
+
             uint32_t t = HALL_PULSE_TIMEOUT_US;
             while (gpio_get_level(PIN_HALL) == 0 && t > 0) {
                 esp_rom_delay_us(100);
                 t -= 100;
             }
-            /* Debounce adicional de 5 ms */
+
             esp_rom_delay_us(5000);
- 
-            /* Re-arma fontes de wakeup e dorme */
             configurar_wakeup();
+            uart_wait_tx_done(UART_NUM_0, 100);
             esp_deep_sleep_start();
- 
-            /* Nunca chega aqui */
         }
- 
-        /*
-         * GPIO4 (DS3231) acordou o chip → cai no ciclo completo abaixo.
-         */
     }
 
+    // Se acordou por timer ou pelo botão (mas o usuário soltou antes de 3s), segue o fluxo normal
     ciclo_completo();
-    
 }

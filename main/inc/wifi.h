@@ -6,6 +6,11 @@
  * Setado quando o IP é obtido com sucesso.
  */
 #define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+#define WIFI_MAXIMUM_RETRY 5
+
+#define PIN_BOTAO_RESET 3
+#define TEMPO_RESET_MS 3000
 
 /**
  * @brief Inicializa Wi-Fi com Provisionamento Inteligente via BLE.
